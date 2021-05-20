@@ -13,10 +13,11 @@ instructions on aws lacking a bit (things will change I'm sure).
 
 ## What will I find in this repo?
 
-* An Terraform stack for 0.13+ AWS Ec2 gitlab runner using [docker-machine](https://docs.docker.com/machine/drivers/aws/)
-* Cloudformation deployment for AWS Ec2 gitlab runner (comming soon) using [docker-machine](https://docs.docker.com/machine/drivers/aws/)
+* An Terraform stack for 0.14+ AWS Ec2 gitlab runner using (comming soon) [docker-machine](https://docs.docker.com/machine/drivers/aws/)
+* Cloudformation deployment for AWS Ec2 gitlab runner using [docker-machine](https://docs.docker.com/machine/drivers/aws/)
 * The Helm chart for gitlab runner (comming soon)
-* Documentation we use to deploy it
+* Documentation with all steps.
+
 
 ## The thinking behind it
 
