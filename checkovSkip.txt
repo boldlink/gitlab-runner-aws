@@ -1,0 +1,7 @@
+CKV_AWS_18: "Ensure the S3 bucket has access logging enabled"
+CKV_AWS_21: "Ensure the S3 bucket has versioning enabled"
+CKV_AWS_79: "Ensure Instance Metadata Service Version 1 is not enabled"
+CKV_AWS_108: "Ensure IAM policies does not allow data exfiltration"
+CKV_AWS_109: "Ensure IAM policies does not allow permissions management without constraints"
+CKV_AWS_110: "Ensure IAM policies does not allow privilege escalation"
+CKV_AWS_111: "Ensure IAM policies does not allow write access without constraints"

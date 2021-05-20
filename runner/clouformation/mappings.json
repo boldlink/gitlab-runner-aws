@@ -1,0 +1,22 @@
+[
+    {
+      "ParameterKey": "GitlabSsmToken",
+      "ParameterValue": "xxx..."
+    }, 
+    {
+      "ParameterKey": "VpcId",
+      "ParameterValue": "vpc-xxx..."
+    }, 
+    {
+      "ParameterKey": "ManageSubnetId",
+      "ParameterValue": "subnet-xxx...,subnet-xxx...,subnet-xxx..."
+    }, 
+    {
+      "ParameterKey": "EcrAccountId",
+      "ParameterValue": ""
+    }, 
+    {
+      "ParameterKey": "EcrRegion",
+      "ParameterValue": ""
+    }
+]
