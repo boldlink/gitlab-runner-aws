@@ -1,0 +1,722 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Gitlab Runner on a Ec2 with Autoscaling and Docker Machine
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: GitLab configuration
+        Parameters:
+          - GitlabUrl
+          - GitlabSsmToken
+          - Environment
+          - RunnerTags
+      - Label:
+          default: VPC configuration
+        Parameters:
+          - VpcId
+          - ManageSubnetId
+          - MachineOptionsPrivate
+      - Label:
+          default: Gitlab Runner Manage Instance parameters
+        Parameters:
+          - InstanceTypeManage
+          - AmiId
+          - MachineOptionsUseSpot
+          - MachineOptionsMaxSpotPrice
+          - CloudwatchRetention
+          - KeySpec
+          - KeyUsage
+          - PendingWindowInDays
+      - Label:
+          default: Gitlab Runner Executor Instance(s) Parameters
+        Parameters:
+          - InstanceTypeExecutor
+          - DockerPrivileged
+          - DockerDisableCache
+          - DockerTlsCertDir
+          - DockerPrivileged
+          - DockerDisableEntrypointOverride
+          - DockerOomKillDisable
+          - EcrAccountId
+          - EcrRegion
+          - ExecutorDockerImage
+          - ExecutorMaxConcurrency
+          - MachineIdleCount
+          - MachineMaxBuilds
+          - AutoScalingWeekdaysIdleCount
+          - AutoScalingWeekendIdleCount
+          - TimeZone
+  LintSpellExclude:
+    - files/bootstrap.sh
+    - autoscaler
+    - Lambda
+    - Security Group
+    - Target Group
+    - Kubernetes
+    - Instance Profile
+    - Role
+    - Enabled
+    - Disabled
+    - Subnet
+    - (Optional)
+    - Custom
+    - Unmanaged
+  cfn-lint: { config: { ignore_checks: [W2030, W9002, W9003, W9004, E3008, W9006]}}
+Parameters:
+  InstanceTypeManage:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type used for gitlab runner machine 
+  InstanceTypeExecutor:
+    Type: String
+    Default: t3a.small
+    Description: EC2 instance type used for the executors where the jobs are run
+  AmiId:
+    Description: AMI used for the Ec2 gitlab manage instance 
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  RunnerTags:
+    Type: String
+    Default: 'ec2'
+    Description: Comma-separated list of tags associated with the runner, ex. "gitlab, runner, prod"
+  ManageSubnetId:
+    Description: Subnet Ids for the gitlab-runner manage machine, typically private subnets. Select multiple subnets for High Availability.
+    Type: List<AWS::EC2::Subnet::Id>
+  GitlabUrl:
+    Description: Url of the gitlab instance the gitlab-runner is connecting to
+    Type: String
+    Default: https://gitlab.com/
+  GitlabSsmToken:
+    Description: SSM path for Gitlab runner token used to register the runner with your gitlab instance
+    Type: String
+  TimeZone:
+    Description: Timezone for the autscaling section of the config.toml crontab, it is important for the scaling of instances using the proper schedule
+    Default: GMT
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Vpc Id to be used for the Gitlab runner manage and executor ec2 instance
+  ExecutorDockerImage:
+    Description: Gitlab-runner executor default image used when not specified otherwise on the pipeline file .gitlab-ci.yaml
+    Type: String
+    Default: alpine:latest
+  CloudwatchRetention:
+    Description: Gitlab runner manage instance Cloudwatch Log retention
+    Default: 365
+    Type: String
+  DockerDisableCache:
+    Description: Disable runners docker cache
+    Type: String
+    Default: "false" 
+  DockerTlsCertDir:
+    Type: String
+    Default: ""
+    Description: The directory for your runner-> executor certs, by default not necessary
+  DockerPrivileged:
+    Description: Allow the Pipelines to access docker.sock on gitlab-runner executor instance
+    Default: "false"
+    Type: String
+  DockerDisableEntrypointOverride:
+    Type: String
+    Description: Allow to override your pipeline docker image entrypoint
+    Default: "false"
+  DockerOomKillDisable:
+    Type: String
+    Description: By default, kernel kills processes in a container if an out-of-memory (OOM) error occurs, use this to change the standard behaviour
+    Default: "false"
+  MachineIdleCount:
+    Type: String
+    Default: 1
+    Description: Nr of instance count on idle mode
+  MachineMaxBuilds:
+    Type: String
+    Default: 10
+    Description: Maximum nr of builds you can run on your executors and in parallel
+  AutoScalingWeekdaysIdleCount:
+    Type: String
+    Default: 5
+    Description: Idle count of the Gitlab runner scaled instances over the weekdays - schedule will work from 9am to 5pm and then default to the limit of 1 
+  AutoScalingWeekendIdleCount:
+    Type: String
+    Default: 1
+    Description: Idle count of the Gitlab runner scaled instances over the weekend - schedule will work from 9am to 5pm and then default to the limit of 1 
+  MachineOptionsPrivate:
+    Type: String
+    Default: 'true'
+    Description: By default both the gitlab runner manage and executor should run on private subnets, unless there is a specific reason for it then change the value to false - also change the subnets to public subnets
+  ExecutorMaxConcurrency:
+    Type: String
+    Default: 10
+    Description: Gitlab runner maximum concurrent jobs you can execute
+  MachineOptionsUseSpot:
+    Type: String
+    Default: 'false'
+    Description: Executors run on spot instances (true) Executors run on on-demand instances (false)
+  MachineOptionsMaxSpotPrice:
+    Type: String
+    Default: '1.0'
+    Description: If MachineOptionsUseSpot setting = true this parameter will determine the max price to bid for
+  EcrAccountId:
+    Type: String
+    Description: The account ID of your ECR repositories for the ecr login helper configuration
+  EcrRegion:
+    Type: String
+    Description: The Region of your ECR repositories for the ecr login helper configuration
+  Environment:
+    Type: String
+    Default: Dev
+    Description: The environment where the runner is deployed
+  KeySpec: 
+    Type: String
+    Default: SYMMETRIC_DEFAULT
+    Description: LogGroup KMS key key specification
+  KeyUsage: 
+    Type: String
+    Default: ENCRYPT_DECRYPT
+    Description: LogGroup KMS key usage
+  PendingWindowInDays: 
+    Type: Number
+    Default: 30
+    Description: LogGroup KMS key pending deletion days
+
+Resources:
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /aws/ec2/gitlab-runner/${AWS::StackName}
+      RetentionInDays: !Ref CloudwatchRetention
+      KmsKeyId: !GetAtt KmsLogGroup.Arn
+
+  KmsLogGroup:
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: String
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - 
+          Sid: RootAccess
+          Effect: Allow
+          Principal:
+            Service: !Sub "logs.${AWS::Region}.${AWS::URLSuffix}"
+          Action:
+            - "kms:Encrypt*"
+            - "kms:Decrypt*"
+            - "kms:ReEncrypt*"
+            - "kms:GenerateDataKey*"
+            - "kms:Describe*"
+          Resource: '*'
+          Condition:
+            ArnLike:
+              "kms:EncryptionContext:aws:logs:arn": !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+        - 
+          Sid: LogGroup
+          Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action: 'kms:*'
+          Resource: '*'
+      KeySpec: !Ref KeySpec
+      KeyUsage: !Ref KeyUsage
+      PendingWindowInDays: !Ref PendingWindowInDays
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} Gitlab runner Security Group' 
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - 
+          CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+          Description: Allow all outgoing traffic
+
+  SecurityGroupExecutor:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} Gitlab runner Security Group' 
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - 
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !GetAtt SecurityGroup.GroupId
+          Description: Allow Ssh into the runner
+        - 
+          IpProtocol: tcp
+          FromPort: 2376
+          ToPort: 2376
+          SourceSecurityGroupId: !GetAtt SecurityGroup.GroupId
+          Description: Allow 2376 into the runner
+      SecurityGroupEgress:
+        - 
+          CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+          Description: Allow all outgoing traffic
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      
+      VersioningConfiguration:
+        Status: Suspended
+  S3BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          -
+            Sid: S3List
+            Action:
+              - "s3:ListBucket"
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}'
+            Principal:
+              AWS: 
+                - !GetAtt IamRoleManage.Arn
+                - !GetAtt IamRoleExecutor.Arn
+          -
+            Sid: S3ReadWrite
+            Action:
+              - "s3:DeleteObject"
+              - "s3:GetObject"
+              - "s3:PutObject"
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
+            Principal:
+              AWS: 
+                - !GetAtt IamRoleManage.Arn
+                - !GetAtt IamRoleExecutor.Arn
+
+  IamRoleManage:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub 'ec2.${AWS::URLSuffix}'
+            Action:
+              - 'sts:AssumeRole'
+      
+  IamPolicyManage:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Sid: CloudwatchPermissions
+            Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+              - "logs:DescribeDestinations"
+              - "logs:DescribeLogGroups"
+              - "logs:DescribeLogStreams"
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/ec2/gitlab-runner/${AWS::StackName}:*"
+          - 
+            Sid: Ecr
+            Effect: Allow
+            Action: 
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:BatchDeleteImage"
+              - "ecr:BatchGetImage"
+              - "ecr:CompleteLayerUpload"
+              - "ecr:CreateRepository"
+              - "ecr:DeleteLifecyclePolicy"
+              - "ecr:DeleteRegistryPolicy"
+              - "ecr:DeleteRepository"
+              - "ecr:DeleteRepositoryPolicy"
+              - "ecr:DescribeImageScanFindings"
+              - "ecr:DescribeImages"
+              - "ecr:DescribeRegistry"
+              - "ecr:DescribeRepositories"
+              - "ecr:GetAuthorizationToken"
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:GetLifecyclePolicy"
+              - "ecr:GetLifecyclePolicyPreview"
+              - "ecr:GetRegistryPolicy"
+              - "ecr:GetRepositoryPolicy"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:ListImages"
+              - "ecr:ListTagsForResource"
+              - "ecr:PutImage"
+              - "ecr:PutImageScanningConfiguration"
+              - "ecr:PutImageTagMutability"
+              - "ecr:PutLifecyclePolicy"
+              - "ecr:PutRegistryPolicy"
+              - "ecr:PutReplicationConfiguration"
+              - "ecr:SetRepositoryPolicy"
+              - "ecr:StartImageScan"
+              - "ecr:StartLifecyclePolicyPreview"
+              - "ecr:TagResource"
+              - "ecr:UntagResource"
+              - "ecr:UploadLayerPart"
+            Resource: '*'
+          - 
+            Sid: Ec2Permissions
+            Effect: Allow
+            Action: 
+              - "ec2:CreateKeyPair"
+              - "ec2:DeleteKeyPair"
+              - "ec2:ImportKeyPair"
+              - "ec2:DescribeAddresses"
+              - "ec2:DescribeAvailabilityZones"
+              - "ec2:DescribeInstanceStatus"
+              - "ec2:DescribeInstanceTypes"
+              - "ec2:DescribeInstances"
+              - "ec2:DescribeKeyPairs"
+              - "ec2:DescribeRegions"
+              - "ec2:DescribeSecurityGroups"
+              - "ec2:DescribeSubnets"
+              - "ec2:CreateTags"
+              - "autoscaling:DescribeAutoScalingGroups"
+              - "autoscaling:DescribeAutoScalingInstances"
+              - "autoscaling:UpdateAutoScalingGroup"
+            Resource: '*'
+          - 
+            Sid: Ec2RunInstances
+            Effect: Allow
+            Action: 
+              - "ec2:RunInstances"
+            Resource: 
+              - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/ami-*"
+              - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+              - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:key-pair/*"
+              - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+              - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:placement-group/*"
+              - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+              - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+              - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+          -
+            Sid: Ec2AdditionalPerm
+            Effect: Allow
+            Action:
+              - "ec2:TerminateInstances"
+              - "ec2:StopInstances"
+              - "ec2:StartInstances"
+              - "ec2:RebootInstances"
+            Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+            Condition:
+              StringEquals:
+                "ec2:ResourceTag/stackName": !Sub "${AWS::StackName}"
+          - 
+            Sid: S3List
+            Effect: Allow
+            Action: 
+              - 's3:ListBucket'
+              - "s3:GetBucketLocation"
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}'
+          - 
+            Sid: S3ReadWrite
+            Effect: Allow
+            Action: 
+              - "s3:DeleteObject"
+              - "s3:GetObject"
+              - "s3:ListMultipartUploadParts"
+              - "s3:PutObject"
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
+          - 
+            Sid: S3Encryption
+            Effect: Allow
+            Action: 
+              - 's3:GetEncryptionConfiguration'
+            Resource: "*"
+          -
+            Sid: PassRoleToExecutors
+            Effect: Allow
+            Action: 
+              - 'iam:GetRole'
+              - 'iam:PassRole'
+            Resource: !GetAtt IamRoleExecutor.Arn
+          -
+            Sid: CreateSpotIamServiceLinkedRole
+            Effect: Allow
+            Action: "iam:CreateServiceLinkedRole"
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/spot.${AWS::URLSuffix}/AWSServiceRoleForEC2Spot'
+            Condition:
+              StringLike:
+                iam:AWSServiceName: !Sub "spot.${AWS::URLSuffix}"
+          -
+            Sid: PolicySpotIamServiceLinkedRole
+            Effect: Allow
+            Action: 
+              - 'iam:AttachRolePolicy'
+              - 'iam:PutRolePolicy'
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/spot.${AWS::URLSuffix}/AWSServiceRoleForEC2Spot'
+          - 
+            Sid: SSMConnect
+            Effect: Allow
+            Action: 
+              - 'ssmmessages:CreateControlChannel'
+              - 'ssmmessages:CreateDataChannel'
+              - 'ssmmessages:OpenControlChannel'
+              - 'ssmmessages:OpenDataChannel'
+            Resource: '*'
+      Roles:
+        - !Ref IamRoleManage
+
+  InstanceProfileManage:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref IamRoleManage
+
+  IamRoleExecutor:
+    Type: AWS::IAM::Role
+    Properties:
+      # RoleName: !Sub 'gitlab-executor-role-${AWS::Region}-${AWS::AccountId}'
+      Path: /      
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub 'ec2.${AWS::URLSuffix}'
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: Allow
+          PolicyDocument:
+            Statement: 
+              - Sid: S3List
+                Effect: Allow
+                Action: 
+                  - 's3:ListBucket'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}'
+              - Sid: S3All
+                Effect: Allow
+                Action: 
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
+              - Sid: DeployPermissions
+                Effect: Allow
+         
+                Action:
+                  - 'ssm:GetParameters'
+                Resource: '*'          
+
+  InstanceProfileExecutor:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref IamRoleExecutor
+
+  LaunchTemplateManage:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceTypeManage
+        DisableApiTermination: false
+        ImageId: !Ref AmiId
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfileManage.Arn
+        MetadataOptions:
+            HttpEndpoint: enabled
+            HttpPutResponseHopLimit: 64
+            # Docker-Machine 0.16.2 doesn't support IMDSv2
+            HttpTokens: optional
+        SecurityGroupIds:
+        - !Ref SecurityGroup
+        TagSpecifications:
+        - ResourceType: instance
+          Tags:
+          - Key: Name
+            Value: !Sub ${AWS::StackName}
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+
+            # Set variables
+            # Get current subnet-id
+            MAC_ADDRESS=$(curl http://169.254.169.254/latest/meta-data/network/interfaces/macs/)
+            SUBNET_ID=$(curl http://169.254.169.254/latest/meta-data/network/interfaces/macs/${!MAC_ADDRESS}subnet-id)
+            AZ=$(curl http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            AZ_SYMBOL="${!AZ: -1}"
+            REGION="${!AZ::-1}"
+
+            sudo yum update -y
+            sudo yum install jq -y
+
+            EXECUTOR_SG=$(aws ec2 describe-security-groups --region $REGION | jq -r --arg name "${AWS::StackName}-SecurityGroupExecutor" '.SecurityGroups[] | select(.GroupName | contains($name)).GroupName')
+
+            # Install awslogs agent
+            sudo yum install -y awslogs
+            sudo systemctl start awslogsd
+            sudo systemctl start awslogsd
+
+            sudo mv /etc/awslogs/awscli.conf{,.old}
+
+            cat <<EOF >/etc/awslogs/awscli.conf
+            [plugins]
+            cwlogs = cwlogs
+            [default]
+            region = ${!REGION}
+            EOF
+
+            cat <<EOF >/etc/awslogs/awslogs.conf
+            [general]
+            state_file = /etc/awslogs/agent-state
+
+            [/var/log/messages]
+            file = /var/log/messages
+            log_group_name = /aws/ec2/gitlab-runner/${AWS::StackName}
+            log_stream_name = {instance_id}/messages
+            datetime_format = %b %d %H:%M:%S
+            EOF
+
+            # Install Docker
+            sudo amazon-linux-extras install docker
+            sudo service docker start
+            sudo yum -y install docker
+
+            # Install docker-machine
+            base=https://github.com/docker/machine/releases/download/v0.16.2 &&
+            curl -L $base/docker-machine-$(uname -s)-$(uname -m) >/tmp/docker-machine &&
+            sudo mv /tmp/docker-machine /usr/bin/docker-machine &&
+            sudo chmod +x /usr/bin/docker-machine
+
+            # Create a dummy machine so that the cert is generated properly
+            # See: https://gitlab.com/gitlab-org/gitlab-runner/issues/3676
+            # See: https://github.com/docker/machine/issues/3845#issuecomment-280389178
+            export USER=root
+            export HOME=/root
+            docker-machine create --driver none --url localhost dummy-machine
+            docker-machine rm -y dummy-machine
+            unset HOME
+            unset USER
+
+            # Add the ecr login helper
+            sudo yum install -y amazon-ecr-credential-helper
+
+            cat <<EOF >/root/.docker/config.json
+            {
+              "credHelpers": {
+                "${EcrAccountId}.dkr.ecr.${EcrRegion}.${AWS::URLSuffix}": "ecr-login"
+              }
+            }
+            EOF
+
+            # Install and configure gitlab runners
+            wget https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.rpm.sh 
+            sudo bash script.rpm.sh
+            sudo yum install gitlab-runner -y
+
+            # Grab gitlab token from ssm 
+            cat <<EOF >/etc/gitlab-runner/grab_token.sh
+            #!/bin/bash
+            sed -i -e "s.<TOKEN>.$(aws ssm get-parameter --name ${GitlabSsmToken} --with-decryption --region ${!REGION} --output text | awk {'print $7'})." /etc/gitlab-runner/config.toml
+            EOF
+
+            # TODO: Add runners.docker  allowed_images = <ECRUri>
+            cat <<EOF >/etc/gitlab-runner/config.toml
+            concurrent = ${ExecutorMaxConcurrency}
+            check_interval = 0
+
+            [session_server]
+              session_timeout = 1800
+
+            [[runners]]
+              name = "${AWS::StackName} @${Environment}"
+              url = "${GitlabUrl}"
+              token = "<TOKEN>"
+              executor = "docker+machine"
+              environment = ["DOCKER_TLS_CERTDIR=${DockerTlsCertDir}"]
+              [runners.custom_build_dir]
+              [runners.cache]
+                Type = "s3"
+                Shared = true
+                [runners.cache.s3]
+                  ServerAddress = "s3.${AWS::URLSuffix}"
+                  BucketName = "${S3Bucket}"
+                  BucketLocation = "${!REGION}"
+                [runners.cache.gcs]
+                [runners.cache.azure]
+              [runners.docker]
+                tls_verify = false
+                image = "${ExecutorDockerImage}"
+                privileged = ${DockerPrivileged}
+                disable_entrypoint_overwrite = ${DockerDisableEntrypointOverride}
+                oom_kill_disable = ${DockerOomKillDisable}
+                disable_cache = ${DockerDisableCache}
+                volumes = ["/cache"]
+                shm_size = 0
+              [runners.machine]
+                IdleCount = ${MachineIdleCount}
+                IdleTime = 1800
+                MaxBuilds = ${MachineMaxBuilds}
+                MachineDriver = "amazonec2"
+                MachineName = "${AWS::StackName}-%s"
+                MachineOptions = [
+                  "amazonec2-region=${!REGION}", 
+                  "amazonec2-zone=${!AZ_SYMBOL}", 
+                  "amazonec2-vpc-id=${VpcId}", 
+                  "amazonec2-subnet-id=${!SUBNET_ID}", 
+                  "amazonec2-iam-instance-profile=${InstanceProfileExecutor}", 
+                  "amazonec2-private-address-only=${MachineOptionsPrivate}", 
+                  "amazonec2-use-private-address=${MachineOptionsPrivate}", 
+                  "amazonec2-tags=stackName,${AWS::StackName},docker-machine,aws,environment,${Environment},${RunnerTags}", 
+                  "amazonec2-security-group=${!EXECUTOR_SG}", 
+                  "amazonec2-instance-type=${InstanceTypeExecutor}", 
+                  "amazonec2-request-spot-instance=${MachineOptionsUseSpot}", 
+                  "amazonec2-spot-price=${MachineOptionsMaxSpotPrice}"
+                ]
+                OffPeakTimezone = "${TimeZone}"
+                OffPeakIdleCount = 0
+                OffPeakIdleTime = 3600
+
+                [[runners.machine.autoscaling]]
+                  Periods = ["* * 9-17 * * mon-fri *"]
+                  Timezone = "${TimeZone}"
+                  IdleCount = ${AutoScalingWeekdaysIdleCount}
+                  IdleTime = 3600
+
+                [[runners.machine.autoscaling]]
+                  Periods = ["* * * * * sat,sun *"]
+                  Timezone = "${TimeZone}"
+                  IdleCount = ${AutoScalingWeekendIdleCount}
+                  IdleTime = 60
+            EOF
+
+            # Inject secret in gitlab config
+            sudo bash /etc/gitlab-runner/grab_token.sh > /dev/null 2>&1 && 
+            sudo rm /etc/gitlab-runner/grab_token.sh
+
+            sudo systemctl restart gitlab-runner
+
+  Asg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: S3Bucket
+    Properties:
+      VPCZoneIdentifier: !Ref ManageSubnetId
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplateManage
+        Version: !GetAtt LaunchTemplateManage.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '1'
