@@ -18,6 +18,7 @@ instructions on aws lacking a bit (things will change I'm sure).
 * The Helm chart for gitlab runner (comming soon)
 * Documentation with all steps.
 
+
 ## The thinking behind it
 
 This solution is based on the following principles.
